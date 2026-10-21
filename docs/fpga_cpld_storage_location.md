@@ -211,7 +211,19 @@ bool cpld_jtag_sram_load(jtag_t* const jtag)
    +--> configures CPLD via JTAG / startup auto-load
 ```
 
-## 6. 最终一句话
+## 6. MCU 数据手册链接
+
+MCU 为 NXP LPC43xx 系列，本文对应的主要器件是 LPC43xx（例如 LPC4350/4330/4320 这类成员），其官方数据手册如下：
+
+- NXP LPC43xx data sheet: https://www.nxp.com/docs/en/data-sheet/LPC4350_30_20_10.pdf
+
+这个链接适合用来对照：
+
+- LPC43xx 的内核 / 外设 / 时钟 / SPIFI / SSP / GPIO / USB / DMA 等结构
+- MCU 是如何从 SPIFI 启动并运行固件
+- 为什么 HackRF 会把 firmware 存放在外部 SPI flash，而不是依赖 MCU 内部 flash
+
+## 7. 最终一句话
 
 “FPGA/CPLD 的配置固件，不在 MCU 内部 flash，而是在板载外部 SPI flash 里；MCU 启动时从这里读取并下载到 FPGA/CPLD。”
 
