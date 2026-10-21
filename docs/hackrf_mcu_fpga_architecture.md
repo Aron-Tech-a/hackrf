@@ -366,24 +366,332 @@ sequenceDiagram
 3. 让 FPGA 接管 DSP 和数据格式转换
 4. 最后一层再和 USB host 交换包
 
-## 6. 实际代码对应关系
+## 6. 代码逐函数解读版
+
+下面按“函数调用链”展开，直接对应到源码的真实执行路径。
+
+### 6.1 启动入口：`main()`
+
+位置：`firmware/hackrf_usb/hackrf_usb.c`
+
+`main()` 做的第一件事是：
+
+1. 复制 M0 程序到 RAM
+2. 检测硬件平台
+3. 初始化 GPIO / 电源 / 时钟 / RF 路径
+4. 唤醒 M0
+5. 对 HackRF Pro 执行 FPGA bitstream 下载
+6. 初始化 `radio` 和 USB
+
+关键代码：
+
+```c
+ipc_halt_m0();
+ipc_start_m0((uint32_t) &__ram_m0_start__);
+
+#ifdef IS_PRALINE
+if (IS_PRALINE) {
+    fpga_image_load(&fpga_loader, 0);
+}
+#endif
+
+radio_init(&radio);
+```
+
+这里要注意：
+
+- M0 是 timing-critical 的 SGPIO 执行器
+- M4 是更高层的控制器
+- `fpga_image_load()` 是 boot 阶段中最核心的 FPGA 配置动作
+
+### 6.2 FPGA 配置入口：`fpga_image_load()`
+
+位置：`firmware/common/fpga_image.c`
+
+函数职责：
+
+- 读取 bitstream header
+- 计算当前 bitstream 的偏移地址
+- 逐块读取压缩后的 FPGA image
+- 通过 callback 把数据交给 SPI 配置程序
+
+关键逻辑：
+
+```c
+uint32_t num_bitstreams, bitstream_offset;
+loader->read(addr, 4, (uint8_t*) &num_bitstreams);
+loader->read(addr + 4 * (index + 1), 4, (uint8_t*) &bitstream_offset);
+
+const bool success = ice40_spi_syscfg_program(
+    &ice40,
+    loader->out_buffer,
+    fpga_image_read_block_cb,
+    &fpga_image_ctx);
+```
+
+这里的关键理解是：
+
+- 它不是直接把内存“复制进 FPGA”
+- 它是把位流文件送到 FPGA 的配置接口
+- 这一步完成后，FPGA 才具备“运行的硬件逻辑”
+
+### 6.3 位流下载器：`ice40_spi_syscfg_program()`
+
+位置：`firmware/common/ice40_spi.c`
+
+这是 FPGA 配置的真正实现函数：
+
+```c
+gpio_clear(drv->gpio_creset);
+delay_us(1800);
+gpio_set(drv->gpio_creset);
+
+gpio_set(drv->gpio_select);
+spi_ssp1_transfer_word(0);
+
+gpio_clear(drv->gpio_select);
+for (;;) {
+    size_t read_sz = read_block_cb(read_ctx);
+    if (read_sz == 0)
+        break;
+    for (size_t j = 0; j < read_sz; j++) {
+        spi_ssp1_transfer_word(buf[j]);
+    }
+}
+
+gpio_set(drv->gpio_select);
+return gpio_read(drv->gpio_cdone);
+```
+
+它做了几件事：
+
+1. 拉低 `CRESET_B`，强制 FPGA 进入配置态
+2. 延时以清空内部配置状态
+3. 用 SPI 把 bitstream 串行发送给 FPGA
+4. 发送完毕后等待 `CDONE` 变高
+
+这里只是“烧录硬件”，不是运行时寄存器控制。
+
+### 6.4 SGPIO 方向控制：`sgpio_configure()`
+
+位置：`firmware/common/sgpio.c`
+
+这个函数负责把 SGPIO 方向切到 RX/TX：
+
+```c
+const uint_fast8_t cpld_direction = (direction == SGPIO_DIRECTION_TX) ? 1 : 0;
+SGPIO_GPIO_OUTREG =
+      (cpld_direction << 11)
+    | (1L << 10);
+```
+
+关键解释：
+
+- `SGPIO11` 决定方向：
+  - TX = 1
+  - RX = 0
+- `SGPIO10` 控制 codec data stream 使能/禁止
+- `SGPIO8`/`SGPIO9` 负责时钟和捕获
+- `SGPIO0..7` 承担数据位
+
+这一步本质上是：
+
+- MCU 控制 SGPIO 总线 “流向哪里”
+- FPGA 和 ADC/DAC 只能在这个方向下工作
+
+### 6.5 FPGA runtime register：`fpga_reg_write()` / `fpga_reg_read()`
+
+位置：`firmware/common/fpga.c`
+
+运行时控制不是用 RAM，而是通过寄存器接口：
+
+```c
+uint8_t fpga_reg_read(fpga_driver_t* const drv, uint8_t r)
+{
+    uint8_t v;
+    v = ice40_spi_read(drv->bus, r);
+    drv->regs[r] = v;
+    return v;
+}
+
+void fpga_reg_write(fpga_driver_t* const drv, uint8_t r, uint8_t v)
+{
+    drv->regs[r] = v;
+    ice40_spi_write(drv->bus, r, v);
+    FPGA_REG_SET_CLEAN(drv, r);
+}
+```
+
+这说明：
+
+- MCU 访问 FPGA 的方式是寄存器写入，不是直接访问 FPGA 内部 RAM
+- 软件调用 `fpga_set_rx_dc_block_enable()`、`fpga_set_rx_decimation_ratio()` 等函数，最终都落到 `fpga_reg_write()`
+
+例如：
+
+```c
+void fpga_set_rx_decimation_ratio(fpga_driver_t* const drv, const uint8_t value)
+{
+    set_FPGA_STANDARD_RX_DECIM(drv, value & 0b111);
+    fpga_regs_commit(drv);
+}
+```
+
+这实际上是在改 FPGA DSP 配置寄存器。
+
+### 6.6 FPGA top-level：`Top.elaborate()`
+
+位置：`firmware/fpga/top/standard.py`
+
+这个函数是 FPGA gateware 的中心：
+
+1. 创建 ADC/DAC 接口 (`MAX586xInterface`)
+2. 创建 MCU 接口 (`SGPIOInterface`)
+3. 组装 RX chain
+4. 组装 TX chain
+5. 绑定 SPI register interface
+6. 把寄存器映射到 DSP 控制信号
+
+最关键的是：
+
+```python
+m.submodules.adcdac_intf = adcdac_intf = MAX586xInterface(adc_domain=adc_clk, dac_domain=dac_clk)
+m.submodules.mcu_intf    = mcu_intf    = SGPIOInterface(sample_width=16, domain="sync")
+```
+
+然后：
+
+```python
+connect(m, last, mcu_intf.adc_stream)
+```
+
+和：
+
+```python
+last = mcu_intf.dac_stream
+for block in tx_chain.values():
+    connect(m, last, block.input)
+    last = block.output
+connect(m, last, adcdac_intf.dac_stream)
+```
+
+这两段代表：
+
+- RX: ADC → FPGA 内部 chain → SGPIO / MCU
+- TX: MCU / SGPIO → FPGA internal chain → DAC
+
+### 6.7 SGPIO FPGA 接口：`SGPIOInterface.elaborate()`
+
+位置：`firmware/fpga/interface/sgpio.py`
+
+这是 FPGA 侧真正跟 MCU 交互的实现：
+
+- 配置方向 `direction_i`
+- 如果方向为 RX，则允许 ADC 采样流进 FPGA
+- 如果方向为 TX，则允许 FPGA 数据流进 DAC
+- 处理 `tx_fifo` 和 capture trigger
+
+关键逻辑：
+
+```python
+direction_i = platform.request("direction").i
+transfer_from_adc = (direction == 0)
+```
+
+和：
+
+```python
+with m.FSM():
+    with m.State("IDLE"):
+        with m.If(transfer_from_adc):
+            if adc_stream.valid & capture:
+                m.next = "RX0"
+        with m.Else():
+            with m.If(dac_stream.ready & capture):
+                m.next = "TX0"
+```
+
+这说明 FPGA 侧本质上是一个时序状态机：
+
+- RX 状态：接收 ADC，送给 host
+- TX 状态：接收 host，送给 DAC
+
+### 6.8 M0 SGPIO timing loop：`sgpio_m0.s`
+
+位置：`firmware/hackrf_usb/sgpio_m0.s`
+
+M0 是不走常规函数调用的底层定时实现，代码注释写得很明确：
+
+- 运行在 Cortex-M0
+- 处理物理层时序要求高的 SGPIO exchange
+- 每次处理 32 bytes
+- 读取/写入 SGPIO shadow registers
+- 处理 RX 和 TX shortfall/overrun
+
+关键说明：
+
+> The M0 reads or writes 32 bytes at a time from the SGPIO registers, transferring these bytes to or from a shared USB bulk buffer.
+
+因此：
+
+- M0 不负责高层控制逻辑
+- 它负责“在严格时序下把 32-byte burst 在 SGPIO 和 buffer 间搬运”
+- M4 负责和 USB host / radio config 交互
+
+### 6.9 一条完整的函数调用链
+
+最终可以把整个链路压缩成：
+
+```text
+USB Host
+  -> libhackrf
+  -> usb_vendor_request_write_fpga_reg / read_fpga_reg
+  -> fpga_reg_write / fpga_reg_read
+  -> ice40_spi_write / ice40_spi_read
+  -> FPGA register interface (SPI)
+  -> standard.py Top.elaborate() DSP control signals
+
+   or:
+
+USB Host
+  -> bulk OUT / bulk IN
+  -> M4 core
+  -> M0 SGPIO loop
+  -> SGPIO shadow registers
+  -> FPGA SGPIOInterface state machine
+  -> ADC / DAC data path
+```
+
+这就是 HackRF 中“控制平面”和“数据平面”的真实边界。
+
+## 7. 实际代码对应关系
 
 - MCU 控制入口：`firmware/hackrf_usb/hackrf_usb.c`
+- 位流加载：`firmware/common/fpga_image.c`
+- FPGA SPI 配置：`firmware/common/ice40_spi.c`
 - SGPIO 配置：`firmware/common/sgpio.c`
+- FPGA runtime reg API：`firmware/common/fpga.c`
 - M0 timing-critical 代码：`firmware/hackrf_usb/sgpio_m0.s`
 - FPGA SGPIO 接口：`firmware/fpga/interface/sgpio.py`
 - FPGA top-level：`firmware/fpga/top/standard.py`
 - ADC/DAC interface：`firmware/fpga/interface/max586x.py`
 - FPGA DSP 链：`firmware/fpga/dsp/*.py`
 
-## 7. 一句话总结
+## 8. 一句话总结
 
-MCU 控制 FPGA 与 ADC/DAC 的核心机制，是通过 SGPIO 方向控制 + M0 32-byte burst 时序搬运 + FPGA DSP 接口完成的：
+MCU 控制 FPGA 与 ADC/DAC 的核心机制，是：
+
+- 先用 `fpga_image_load()` 把硬件逻辑烧进 FPGA
+- 再用 `sgpio_configure()` 控制 RX/TX 方向
+- 通过 M0 的 SGPIO burst 传输实时搬运数据
+- 在 FPGA 中通过 DSP chain 和 SPI register 接口完成 ADC/DAC 的高速处理
+
+也就是：
 
 - RX：ADC → FPGA → SGPIO → M0/M4 → USB host
 - TX：USB host → M4/M0 → SGPIO → FPGA → DAC
 
-这就是 HackRF 中“控制平面 + 时序平面 + 数据处理平面”分工的本质。
+这就是 HackRF 的真实工程分工。
 MCU 负责“系统控制和数据搬运协调”，FPGA 负责“实时数字处理”，两者配合完成 HackRF 的 SDR 工作流：
 
 - host 下发参数/样本
