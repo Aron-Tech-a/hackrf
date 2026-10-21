@@ -677,27 +677,122 @@ USB Host
 - ADC/DAC interface：`firmware/fpga/interface/max586x.py`
 - FPGA DSP 链：`firmware/fpga/dsp/*.py`
 
-## 8. 一句话总结
+## 8. 更接近真实硬件时钟时序的波形图
 
-MCU 控制 FPGA 与 ADC/DAC 的核心机制，是：
+下面这张图尽量贴近真实的 GPIO/SGPIO 物理时序，不是纯逻辑状态机图，而是强调：
 
-- 先用 `fpga_image_load()` 把硬件逻辑烧进 FPGA
-- 再用 `sgpio_configure()` 控制 RX/TX 方向
-- 通过 M0 的 SGPIO burst 传输实时搬运数据
-- 在 FPGA 中通过 DSP chain 和 SPI register 接口完成 ADC/DAC 的高速处理
+- SGPIO clock 是外部时钟源
+- ADC/DAC 在时钟边沿输出/采样数据
+- FPGA 侧用 SGPIO shadow/register 进行 burst 传输
+- M0 才是严格时序的搬运核心
 
-也就是：
+```text
+RX 路径（ADC -> FPGA -> MCU）
 
-- RX：ADC → FPGA → SGPIO → M0/M4 → USB host
-- TX：USB host → M4/M0 → SGPIO → FPGA → DAC
+ADC_CLK ───┐───────┐───────┐───────┐───────┐───────┐───────┐───────┐
+           │       │       │       │       │       │       │       │       │
+SGPIO_CLK ─┘   ┌───┘   ┌───┘   ┌───┘   ┌───┘   ┌───┘   ┌───┘   ┌───┘   ┌───┘
+           ┆   ┆   ┆   ┆   ┆   ┆   ┆   ┆   ┆   ┆   ┆   ┆   ┆   ┆   ┆
+SGPIO_D[7:0]  D0  D1  D2  D3  D4  D5  D6  D7  D8  D9  D10 D11 D12 D13 D14 D15
+              │   │   │   │   │   │   │   │   │   │    │    │    │    │
+              └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴────┴────┴────┴────┘
+                                      │
+                                      ▼
+                              FPGA SGPIOInterface
+                              采样/缓存/打包 32-byte burst
+                                      │
+                                      ▼
+                               M0 SGPIO RX loop
+                         读取 SGPIO shadow -> 写入 buffer
+                                      │
+                                      ▼
+                                 M4 USB bulk IN
+                                      │
+                                      ▼
+                                  USB Host
 
-这就是 HackRF 的真实工程分工。
-MCU 负责“系统控制和数据搬运协调”，FPGA 负责“实时数字处理”，两者配合完成 HackRF 的 SDR 工作流：
+TX 路径（Host -> MCU -> FPGA -> DAC）
 
-- host 下发参数/样本
-- MCU 解析并配置 RF 链
-- M0 / SGPIO 负责高速 I/O
-- FPGA 完成 DSP
-- ADC/DAC 把模拟和数字之间连接起来
+USB Host ─────┐
+              │ bulk OUT samples
+              ▼
+         M4 buffer / M0 TX queue
+              │
+              ▼
+        M0 TX_RUN writes SGPIO shadow
+              │
+              ▼
+SGPIO_CLK ───────┐───────┐───────┐───────┐───────┐───────┐───────┐───────┐
+                 │       │       │       │       │       │       │       │
+SGPIO_D[7:0]      D0  D1  D2  D3  D4  D5  D6  D7  D8  D9  D10 D11 D12 D13 D14 D15
+                 │   │   │   │   │   │   │   │   │   │    │    │    │    │
+                 └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴────┴────┴────┴────┘
+                                      │
+                                      ▼
+                              FPGA TX DSP chain
+                       interpolation / CIC / filter / NCO
+                                      │
+                                      ▼
+                              DAC sample clock
+                                      │
+                                      ▼
+                                 analog output
+```
 
-这就是 HackRF 的硬件分工核心。
+这张图的核心含义是：
+
+- SGPIO 不只是“一个普通总线”，而是带时钟边沿和 burst 传输的高速接口
+- ADC/DAC 采样和 SGPIO 交换都是对时钟边沿敏感的
+- FPGA 端通过 `SGPIOInterface` 和 `tx_fifo` 进行 buffer / pipeline 处理
+- M0 负责在严格周期约束下按 32-byte burst 完成搬运
+
+## 9. 极简版最终稿
+
+### HackRF 的硬件分工
+
+- MCU（LPC43xx M4/M0）负责控制平面
+- FPGA 负责数字处理平面
+- ADC/DAC 负责模数/数模转换
+- RF 前端负责射频收发
+
+### MCU 做什么
+
+- 接收 USB host 控制命令
+- 设置频率、采样率、增益、模式
+- 控制 RF 前端和时钟电源
+- 配置 SGPIO direction 和 M0 mode
+- 在 HackRF Pro 上加载 FPGA bitstream
+- 通过 SPI 寄存器接口写 FPGA 参数
+
+### FPGA 做什么
+
+- 读 ADC 数据
+- 在 RX 链路中做 DC blocker、频移、滤波、decimation
+- 在 TX 链路中做 interpolation、CIC、NCO、滤波
+- 接收 MCU 的 SGPIO burst
+- 把处理后的数据交给 DAC
+
+### 实时数据链路
+
+- RX：ADC → FPGA DSP → SGPIO → M0 → M4 → USB Host
+- TX：USB Host → M4 → M0 → SGPIO → FPGA DSP → DAC
+
+### 关键工程事实
+
+- FPGA gateware 位于：`firmware/fpga/`
+- 使用 Amaranth HDL 编写
+- bitstream 打包在：`firmware/fpga/build.py`
+- FPGA 配置在 runtime 时由 MCU 通过 `fpga_image_load()` + `ice40_spi_syscfg_program()` 完成
+- 运行时控制由 `fpga_reg_write()` / `fpga_reg_read()` 完成
+- SGPIO 方向和时序由 `sgpio_configure()` 控制
+
+### 一句话总结
+
+HackRF 的核心不是“MCU 直接处理 IQ 数据”，而是：
+
+- MCU 负责控制和协调
+- FPGA 负责实时 DSP
+- SGPIO 负责高速数据搬运
+- ADC/DAC 负责模拟与数字之间的接口
+
+这就是 HackRF 的本质架构。
