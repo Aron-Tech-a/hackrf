@@ -189,18 +189,201 @@ Host -> USB -> MCU -> FPGA DSP -> DAC -> RF front-end -> antenna
 4. DAC 输出模拟波形
 5. RF 前端进行上变频和发射
 
-## 5. 实际代码对应关系
+## 5. MCU 如何控制 FPGA 读 ADC / 写 DAC
+
+这一节是前面架构图的技术细化：
+
+- MCU 不是直接写 ADC 或直接读 DAC
+- 它控制的是 SGPIO “方向 + 时序 + buffer”
+- 真正的 ADC/DAC 高速访问，是由 SGPIO + FPGA 的数据接口完成的
+
+### 5.1 SGPIO 是关键总线
+
+在 `firmware/common/sgpio.c` 中，注释直接说明了硬件分配：
+
+- `SGPIO0..7` = ADC/DAC 数据位
+- `SGPIO8` = clock input
+- `SGPIO9` = capture input
+- `SGPIO10` = disable codec data stream
+- `SGPIO11` = direction output
+
+关键代码片段：
+
+```c
+// SGPIO0 to 7 = DAC/ADC data bits 0 to 7
+// SGPIO8 Clock Input (External Clock)
+// SGPIO9 Capture Input (Capture/ChipSelect, 1=Enable Capture, 0=Disable capture)
+// SGPIO10 Disable Output (1/High=Disable codec data stream, 0/Low=Enable codec data stream)
+// SGPIO11 Direction Output (1/High=TX mode LPC43xx=>CPLD=>DAC, 0/Low=RX mode LPC43xx<=CPLD<=ADC)
+```
+
+这表示：
+
+- RX 时，MCU 让 SGPIO 进入 “ADC -> FPGA/MCU” 方向
+- TX 时，MCU 让 SGPIO 进入 “MCU/FPGA -> DAC” 方向
+
+### 5.2 RX：从 ADC 读取到 FPGA / MCU
+
+在 `sgpio_configure()` 里，代码会写：
+
+```c
+const uint_fast8_t cpld_direction = (direction == SGPIO_DIRECTION_TX) ? 1 : 0;
+SGPIO_GPIO_OUTREG =
+      (cpld_direction << 11)
+    | (1L << 10);
+```
+
+这里的方向输出是：
+
+- `cpld_direction = 0` → RX 模式
+- `cpld_direction = 1` → TX 模式
+
+在 RX 模式下：
+
+1. ADC 采样数据从模拟前端流入 ADC
+2. ADC 用 SGPIO 时钟和数据线把样本发给 FPGA
+3. FPGA 的 `SGPIOInterface` 接收样本，并按配置把它送进 DSP 链
+4. DSP 链完成 DC blocker / decimation / filter 等处理
+5. 处理后的数据通过 SGPIO 通道再交给 M0/M4
+6. M4 最终通过 USB bulk IN 发给 host
+
+对应 FPGA 代码：
+
+- `firmware/fpga/interface/sgpio.py`
+- `firmware/fpga/top/standard.py`
+
+其中：
+
+```python
+transfer_from_adc = (direction == 0)
+```
+
+说明 FPGA 在 RX 路径上是被配置为“接收 ADC 数据并输出到 MCU/host”的。
+
+### 5.3 TX：从 FPGA / MCU 写入 DAC
+
+TX 路径的方向相反：
+
+- USB host 发 TX IQ samples
+- MCU 把数据放进共享 buffer
+- M0 在 SGPIO TX 模式下，把 buffer 中的数据写到 SGPIO shadow registers
+- FPGA 接收到这些数据后，进入 TX chain：
+  - interpolation
+  - CIC
+  - filtering
+  - NCO
+- 最终 FPGA 把处理后的样本送到 DAC
+
+在 `firmware/fpga/top/standard.py` 中，TX 链是：
+
+```python
+last = mcu_intf.dac_stream
+for block in tx_chain.values():
+    connect(m, last, block.input)
+    last = block.output
+
+connect(m, last, adcdac_intf.dac_stream)
+```
+
+所以 MCU 并不直接把数据 “写到 DAC”，而是把样本送入 FPGA，后者再按 DSP chain 输出到 DAC。
+
+### 5.4 M0 是真正的 SGPIO 时序核心
+
+`firmware/hackrf_usb/sgpio_m0.s` 中明确定义了五个模式：
+
+- `IDLE`
+- `WAIT`
+- `RX`
+- `TX_START`
+- `TX_RUN`
+
+它的注释说明得很明确：
+
+> The M0 reads or writes 32 bytes at a time from the SGPIO registers, transferring these bytes to or from a shared USB bulk buffer.
+
+也就是：
+
+- M0 每次处理 32 bytes
+- 对 RX：从 SGPIO shadow register 读取 ADC 数据，写入 buffer
+- 对 TX：从 buffer 读取样本，写入 SGPIO register，供 FPGA/DAC 使用
+
+这意味着：
+
+- MCU 不是高带宽 DSP 引擎
+- MCU 负责“控制 SGPIO burst 传输”和“与 host 交换 buffer”
+- FPGA 才是实时处理数据的核心
+
+### 5.5 细化时序图：SGPIO 读写 ADC/DAC
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as USB Host
+    participant M4 as LPC43xx M4
+    participant M0 as Cortex-M0 SGPIO core
+    participant SGPIO as SGPIO interface
+    participant FPGA as FPGA DSP logic
+    participant ADC as ADC
+    participant DAC as DAC
+
+    rect rgb(235,245,255)
+        note over M4,FPGA: RX path: ADC -> FPGA -> SGPIO -> M0 -> M4 -> Host
+        Host->>M4: RX enable / start transfer
+        M4->>SGPIO: set direction = RX
+        M4->>M0: mode = RX
+        ADC->>SGPIO: sample clock + I/Q data
+        SGPIO->>FPGA: 32-byte SGPIO burst
+        FPGA->>FPGA: DCBlock / QuarterShift / Filter / Decimator
+        FPGA->>M0: data ready / SGPIO exchange
+        M0->>M4: move bytes to USB buffer
+        M4->>Host: USB bulk IN
+    end
+
+    rect rgb(245,235,255)
+        note over Host,DAC: TX path: Host -> M4 -> M0 -> FPGA -> DAC
+        Host->>M4: TX IQ samples
+        M4->>M0: queue TX buffer
+        M4->>SGPIO: set direction = TX
+        M0->>SGPIO: write 32-byte chunks
+        SGPIO->>FPGA: TX stream
+        FPGA->>FPGA: interpolation / CIC / NCO / filter
+        FPGA->>DAC: output sample stream
+        DAC->>DAC: convert to analog waveform
+    end
+```
+
+### 5.6 关键理解
+
+真正的高速硬件链路是：
+
+- RX：ADC → FPGA DSP → SGPIO → M0 → M4 → USB host
+- TX：USB host → M4 → M0 → SGPIO → FPGA DSP → DAC
+
+所以 MCU 的作用不是直接“取/存 ADC/DAC”，而是：
+
+1. 设置 SGPIO 的模式（RX/TX）
+2. 让 M0 巧妙处理 32-byte burst 时序
+3. 让 FPGA 接管 DSP 和数据格式转换
+4. 最后一层再和 USB host 交换包
+
+## 6. 实际代码对应关系
 
 - MCU 控制入口：`firmware/hackrf_usb/hackrf_usb.c`
-- MCU RF 状态机：`firmware/common/radio.c`
-- SGPIO 数据搬运：`firmware/common/sgpio.c`
+- SGPIO 配置：`firmware/common/sgpio.c`
 - M0 timing-critical 代码：`firmware/hackrf_usb/sgpio_m0.s`
-- FPGA gateware：`firmware/fpga/top/standard.py`
-- FPGA 接口层：`firmware/fpga/interface/*.py`
-- FPGA DSP 层：`firmware/fpga/dsp/*.py`
+- FPGA SGPIO 接口：`firmware/fpga/interface/sgpio.py`
+- FPGA top-level：`firmware/fpga/top/standard.py`
+- ADC/DAC interface：`firmware/fpga/interface/max586x.py`
+- FPGA DSP 链：`firmware/fpga/dsp/*.py`
 
-## 6. 一句话总结
+## 7. 一句话总结
 
+MCU 控制 FPGA 与 ADC/DAC 的核心机制，是通过 SGPIO 方向控制 + M0 32-byte burst 时序搬运 + FPGA DSP 接口完成的：
+
+- RX：ADC → FPGA → SGPIO → M0/M4 → USB host
+- TX：USB host → M4/M0 → SGPIO → FPGA → DAC
+
+这就是 HackRF 中“控制平面 + 时序平面 + 数据处理平面”分工的本质。
 MCU 负责“系统控制和数据搬运协调”，FPGA 负责“实时数字处理”，两者配合完成 HackRF 的 SDR 工作流：
 
 - host 下发参数/样本
